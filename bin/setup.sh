@@ -8,7 +8,7 @@ set -euo pipefail
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-INSTALL_DIR="/usr/local/bin/wifi-daemon"
+INSTALL_DIR="/usr/local/lib/wifi-daemon"
 CONFIG_DIR="/etc/wifi-daemon"
 DATA_DIR="/var/lib/wifi-daemon"
 PLIST_FILE="/Library/LaunchDaemons/com.wifi-daemon.plist"
@@ -97,12 +97,14 @@ install_scripts() {
     cp "$PROJECT_DIR/bin/firewall-manager" "$INSTALL_DIR/"
     cp "$PROJECT_DIR/bin/route-manager" "$INSTALL_DIR/"
     cp "$PROJECT_DIR/bin/network-monitor" "$INSTALL_DIR/"
+    cp "$PROJECT_DIR/bin/subnet-calculator.py" "$INSTALL_DIR/"
     
     # Set permissions
     chmod 755 "$INSTALL_DIR/wifi-daemon"
     chmod 755 "$INSTALL_DIR/firewall-manager"
     chmod 755 "$INSTALL_DIR/route-manager"
     chmod 755 "$INSTALL_DIR/network-monitor"
+    chmod 755 "$INSTALL_DIR/subnet-calculator.py"
     
     # Create symlinks in /usr/local/bin for easy access
     ln -sf "$INSTALL_DIR/wifi-daemon" /usr/local/bin/wifi-daemon

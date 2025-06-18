@@ -7,9 +7,20 @@ set -euo pipefail
 
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-LOG_DIR="${PROJECT_DIR}/logs"
-BACKUP_DIR="${PROJECT_DIR}/backups"
+
+# Check if running from installed location
+if [[ "$SCRIPT_DIR" == "/usr/local/lib/wifi-daemon" ]]; then
+    # Installed mode - use system paths
+    LOG_DIR="/var/lib/wifi-daemon/logs"
+    BACKUP_DIR="/var/lib/wifi-daemon/backups"
+    CONFIG_DIR="/etc/wifi-daemon"
+else
+    # Development mode - use project paths
+    PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+    LOG_DIR="${PROJECT_DIR}/logs"
+    BACKUP_DIR="${PROJECT_DIR}/backups"
+    CONFIG_DIR="${PROJECT_DIR}/config"
+fi
 
 # Ensure directories exist
 mkdir -p "$LOG_DIR" "$BACKUP_DIR"
@@ -96,7 +107,7 @@ backup_rules() {
 # Apply firewall rules
 apply_rules() {
     local wifi_interface="$1"
-    local pf_file="${PROJECT_DIR}/config/pf-wifi.conf"
+    local pf_file="${CONFIG_DIR}/pf-wifi.conf"
     
     if [[ ! -f "$pf_file" ]]; then
         log "ERROR" "Firewall rules file not found: $pf_file"

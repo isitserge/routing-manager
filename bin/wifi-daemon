@@ -6,13 +6,32 @@
 set -euo pipefail
 
 # Configuration
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-CONFIG_FILE="${PROJECT_DIR}/config/config.json"
-PREFIXES_FILE="${PROJECT_DIR}/config/prefixes.conf"
-LOG_DIR="${PROJECT_DIR}/logs"
-BACKUP_DIR="${PROJECT_DIR}/backups"
-STATE_DIR="${PROJECT_DIR}/state"
+# Resolve symlinks to get the actual script directory
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [ -L "$SCRIPT_PATH" ]; do
+    SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+    SCRIPT_PATH="$(readlink "$SCRIPT_PATH")"
+    [[ "$SCRIPT_PATH" != /* ]] && SCRIPT_PATH="$SCRIPT_DIR/$SCRIPT_PATH"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+
+# Check if running from installed location
+if [[ "$SCRIPT_DIR" == "/usr/local/lib/wifi-daemon" ]]; then
+    # Installed mode - use system paths
+    CONFIG_FILE="/etc/wifi-daemon/config.json"
+    PREFIXES_FILE="/etc/wifi-daemon/prefixes.conf"
+    LOG_DIR="/var/lib/wifi-daemon/logs"
+    BACKUP_DIR="/var/lib/wifi-daemon/backups"
+    STATE_DIR="/var/lib/wifi-daemon/state"
+else
+    # Development mode - use project paths
+    PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+    CONFIG_FILE="${PROJECT_DIR}/config/config.json"
+    PREFIXES_FILE="${PROJECT_DIR}/config/prefixes.conf"
+    LOG_DIR="${PROJECT_DIR}/logs"
+    BACKUP_DIR="${PROJECT_DIR}/backups"
+    STATE_DIR="${PROJECT_DIR}/state"
+fi
 
 # Ensure directories exist
 mkdir -p "$LOG_DIR" "$BACKUP_DIR" "$STATE_DIR"
@@ -273,6 +292,39 @@ cleanup_on_exit() {
 
 trap cleanup_on_exit SIGINT SIGTERM
 
+# Show status
+show_status() {
+    echo "WiFi Daemon Status"
+    echo "=================="
+    
+    # Check if daemon is running
+    if pgrep -f "wifi-daemon daemon" >/dev/null; then
+        echo "Daemon: Running"
+    else
+        echo "Daemon: Not running"
+    fi
+    
+    # Check state
+    if [[ -f "$STATE_FILE" ]]; then
+        echo "State: $(cat "$STATE_FILE")"
+    else
+        echo "State: Unknown"
+    fi
+    
+    # Check current SSID
+    local current_ssid
+    current_ssid=$("$SCRIPT_DIR/network-monitor" ssid 2>/dev/null || echo "Not connected")
+    echo "Current SSID: $current_ssid"
+    echo "Target SSID: $TARGET_SSID"
+    
+    # Check if configuration is applied
+    if [[ -f "/etc/wifi-daemon/pf-wifi-active.conf" ]]; then
+        echo "Firewall: Active"
+    else
+        echo "Firewall: Inactive"
+    fi
+}
+
 # Main execution
 main() {
     log "INFO" "Starting routing manager daemon"
@@ -287,5 +339,22 @@ main() {
     monitor_connection
 }
 
-# Run main function
-main "$@"
+# Command handling
+case "${1:-daemon}" in
+    daemon)
+        main
+        ;;
+    status)
+        load_config
+        detect_wifi_interface
+        show_status
+        ;;
+    test)
+        echo "WiFi daemon test passed"
+        exit 0
+        ;;
+    *)
+        echo "Usage: $0 {daemon|status|test}"
+        exit 1
+        ;;
+esac

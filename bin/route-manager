@@ -7,10 +7,20 @@ set -euo pipefail
 
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-LOG_DIR="${PROJECT_DIR}/logs"
-BACKUP_DIR="${PROJECT_DIR}/backups"
-STATE_DIR="${PROJECT_DIR}/state"
+
+# Check if running from installed location
+if [[ "$SCRIPT_DIR" == "/usr/local/lib/wifi-daemon" ]]; then
+    # Installed mode - use system paths
+    LOG_DIR="/var/lib/wifi-daemon/logs"
+    BACKUP_DIR="/var/lib/wifi-daemon/backups"
+    STATE_DIR="/var/lib/wifi-daemon/state"
+else
+    # Development mode - use project paths
+    PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+    LOG_DIR="${PROJECT_DIR}/logs"
+    BACKUP_DIR="${PROJECT_DIR}/backups"
+    STATE_DIR="${PROJECT_DIR}/state"
+fi
 
 # Ensure directories exist
 mkdir -p "$LOG_DIR" "$BACKUP_DIR" "$STATE_DIR"
@@ -439,7 +449,14 @@ verify_routes() {
 
 # Test subnet cutout calculation (dry-run)
 test_cutouts() {
-    local prefixes_file="${1:-config/prefixes.conf}"
+    # Check if running from installed location
+    local default_prefixes
+    if [[ -f "/etc/wifi-daemon/prefixes.conf" ]]; then
+        default_prefixes="/etc/wifi-daemon/prefixes.conf"
+    else
+        default_prefixes="config/prefixes.conf"
+    fi
+    local prefixes_file="${1:-$default_prefixes}"
     
     log "INFO" "Testing subnet cutout calculation (dry-run mode)"
     
@@ -516,7 +533,14 @@ main() {
             backup_routes
             ;;
         test-cutouts)
-            local test_prefixes_file="${2:-config/prefixes.conf}"
+            # Check if running from installed location for default
+            local default_prefixes
+            if [[ -f "/etc/wifi-daemon/prefixes.conf" ]]; then
+                default_prefixes="/etc/wifi-daemon/prefixes.conf"
+            else
+                default_prefixes="config/prefixes.conf"
+            fi
+            local test_prefixes_file="${2:-$default_prefixes}"
             test_cutouts "$test_prefixes_file"
             ;;
         *)

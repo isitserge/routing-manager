@@ -25,8 +25,8 @@ log() {
     local level="$1"
     shift
     case "$level" in
-        PASS) echo -e "${GREEN}[PASS]${NC} $*"; ((TESTS_PASSED++)) ;;
-        FAIL) echo -e "${RED}[FAIL]${NC} $*"; ((TESTS_FAILED++)) ;;
+        PASS) echo -e "${GREEN}[PASS]${NC} $*"; TESTS_PASSED=$((TESTS_PASSED + 1)) ;;
+        FAIL) echo -e "${RED}[FAIL]${NC} $*"; TESTS_FAILED=$((TESTS_FAILED + 1)) ;;
         INFO) echo -e "${BLUE}[INFO]${NC} $*" ;;
         WARN) echo -e "${YELLOW}[WARN]${NC} $*" ;;
         *) echo "[$level] $*" ;;
@@ -37,8 +37,16 @@ log() {
 test_config() {
     log "INFO" "Testing configuration..."
     
-    local config_file="${PROJECT_DIR}/config/config.json"
-    local prefixes_file="${PROJECT_DIR}/config/prefixes.conf"
+    # Check if running from installed location
+    if [[ -f "/etc/wifi-daemon/config.json" ]]; then
+        # Installed mode
+        local config_file="/etc/wifi-daemon/config.json"
+        local prefixes_file="/etc/wifi-daemon/prefixes.conf"
+    else
+        # Development mode
+        local config_file="${PROJECT_DIR}/config/config.json"
+        local prefixes_file="${PROJECT_DIR}/config/prefixes.conf"
+    fi
     
     # Test config.json
     if [[ -f "$config_file" ]]; then
@@ -151,8 +159,10 @@ test_network_interface() {
     
     # Test WiFi interface detection
     if "$PROJECT_DIR/bin/network-monitor" interface >/dev/null 2>&1; then
-        local wifi_interface
-        wifi_interface=$("$PROJECT_DIR/bin/network-monitor" interface)
+        local wifi_output wifi_interface
+        wifi_output=$("$PROJECT_DIR/bin/network-monitor" interface)
+        # Extract just the interface name (e.g., en0) from "WiFi Interface: en0"
+        wifi_interface=$(echo "$wifi_output" | awk -F': ' '{print $2}')
         log "PASS" "WiFi interface detected: $wifi_interface"
         
         # Test if interface exists
@@ -171,7 +181,12 @@ test_firewall_rules() {
     log "INFO" "Testing firewall rule generation..."
     
     local test_interface="en1"  # Common WiFi interface
-    local prefixes_file="${PROJECT_DIR}/config/prefixes.conf"
+    # Check if running from installed location
+    if [[ -f "/etc/wifi-daemon/prefixes.conf" ]]; then
+        local prefixes_file="/etc/wifi-daemon/prefixes.conf"
+    else
+        local prefixes_file="${PROJECT_DIR}/config/prefixes.conf"
+    fi
     
     # Test rule generation
     if "$PROJECT_DIR/bin/firewall-manager" generate "$test_interface" "$prefixes_file" 2>/dev/null; then
@@ -311,8 +326,8 @@ run_all_tests() {
 # Cleanup test files
 cleanup() {
     log "INFO" "Cleaning up test files..."
-    rm -f "${PROJECT_DIR}/config/pf-wifi.conf"
-    rm -f "${PROJECT_DIR}/logs/test.log"
+    rm -f "${PROJECT_DIR}/config/pf-wifi.conf" 2>/dev/null || true
+    rm -f "${PROJECT_DIR}/logs/test.log" 2>/dev/null || true
 }
 
 # Main execution

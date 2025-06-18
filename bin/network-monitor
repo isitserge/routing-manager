@@ -7,8 +7,16 @@ set -euo pipefail
 
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-LOG_DIR="${PROJECT_DIR}/logs"
+
+# Check if running from installed location
+if [[ "$SCRIPT_DIR" == "/usr/local/lib/wifi-daemon" ]]; then
+    # Installed mode - use system paths
+    LOG_DIR="/var/lib/wifi-daemon/logs"
+else
+    # Development mode - use project paths
+    PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+    LOG_DIR="${PROJECT_DIR}/logs"
+fi
 
 # Ensure directories exist
 mkdir -p "$LOG_DIR"

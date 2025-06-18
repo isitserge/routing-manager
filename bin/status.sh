@@ -59,8 +59,16 @@ check_installation() {
 check_configuration() {
     echo -e "${BLUE}Configuration:${NC}"
     
-    local config_file="${PROJECT_DIR}/config/config.json"
-    local prefixes_file="${PROJECT_DIR}/config/prefixes.conf"
+    # Check if running from installed location
+    if [[ -f "/etc/wifi-daemon/config.json" ]]; then
+        # Installed mode
+        local config_file="/etc/wifi-daemon/config.json"
+        local prefixes_file="/etc/wifi-daemon/prefixes.conf"
+    else
+        # Development mode
+        local config_file="${PROJECT_DIR}/config/config.json"
+        local prefixes_file="${PROJECT_DIR}/config/prefixes.conf"
+    fi
     
     # Check config files
     if [[ -f "$config_file" ]]; then
@@ -141,7 +149,14 @@ check_network() {
         
         # Check if connected to target
         local target_ssid
-        target_ssid=$(jq -r '.target_ssid' "${PROJECT_DIR}/config/config.json" 2>/dev/null || echo "SOME-SSID")
+        # Use the same config file detection
+        local config_path
+        if [[ -f "/etc/wifi-daemon/config.json" ]]; then
+            config_path="/etc/wifi-daemon/config.json"
+        else
+            config_path="${PROJECT_DIR}/config/config.json"
+        fi
+        target_ssid=$(jq -r '.target_ssid' "$config_path" 2>/dev/null || echo "SOME-SSID")
         
         if [[ "$current_ssid" == "$target_ssid" ]]; then
             echo -e "  ${GREEN}${OK}${NC} Connected to target SSID"
