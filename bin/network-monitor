@@ -1,0 +1,273 @@
+#!/bin/bash
+
+# macOS Routing Manager - Network Monitor
+# Monitors network state changes using scutil
+
+set -euo pipefail
+
+# Configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+LOG_DIR="${PROJECT_DIR}/logs"
+
+# Ensure directories exist
+mkdir -p "$LOG_DIR"
+
+# Logging function
+log() {
+    local level="$1"
+    shift
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [NETWORK] [$level] $*" | tee -a "$LOG_DIR/wifi-daemon.log"
+}
+
+# Get current WiFi SSID
+get_current_ssid() {
+    local wifi_interface="$1"
+    # NOTE: networksetup -getairportnetwork is broken and unreliable - DO NOT USE
+    # Use system_profiler as the reliable method
+    system_profiler SPAirPortDataType 2>/dev/null | grep -A 2 "Current Network Information:" | grep -v "Current Network Information:" | grep ":" | head -1 | sed 's/://g' | sed 's/^[[:space:]]*//' || echo ""
+}
+
+# Get WiFi interface name
+get_wifi_interface() {
+    networksetup -listallhardwareports | grep -A 1 "Wi-Fi" | grep "Device:" | awk '{print $2}' | head -n 1
+}
+
+# Get network interface info using scutil
+get_interface_info() {
+    scutil --nwi 2>/dev/null || echo "scutil not available"
+}
+
+# Get detailed network state
+get_network_state() {
+    local wifi_interface="$1"
+    
+    echo "=== Network State Report ==="
+    echo "Timestamp: $(date)"
+    echo ""
+    
+    # WiFi interface status
+    echo "WiFi Interface: $wifi_interface"
+    if ifconfig "$wifi_interface" >/dev/null 2>&1; then
+        echo "WiFi Status: Interface exists"
+        
+        # Get IP address
+        local wifi_ip
+        wifi_ip=$(ifconfig "$wifi_interface" | grep "inet " | grep -v "127.0.0.1" | awk '{print $2}' || echo "No IP")
+        echo "WiFi IP: $wifi_ip"
+        
+        # Get current SSID
+        local current_ssid
+        current_ssid=$(get_current_ssid "$wifi_interface")
+        echo "Current SSID: ${current_ssid:-Not connected}"
+        
+        # Get WiFi gateway
+        local wifi_gateway
+        wifi_gateway=$(route -n get default -ifscope "$wifi_interface" 2>/dev/null | grep gateway | awk '{print $2}' || echo "No gateway")
+        echo "WiFi Gateway: $wifi_gateway"
+    else
+        echo "WiFi Status: Interface not found"
+    fi
+    
+    echo ""
+    
+    # Default route information
+    echo "Default Route:"
+    if route -n get default >/dev/null 2>&1; then
+        route -n get default | grep -E "(gateway|interface)" || echo "Unable to get default route details"
+    else
+        echo "No default route found"
+    fi
+    
+    echo ""
+    
+    # Network interfaces from scutil
+    echo "Network Interface Status (scutil):"
+    get_interface_info
+    
+    echo ""
+    
+    # DNS configuration
+    echo "DNS Configuration:"
+    scutil --dns 2>/dev/null | grep -A 5 "resolver #1" || echo "DNS info not available"
+}
+
+# Monitor for network changes
+monitor_changes() {
+    local wifi_interface="$1"
+    local target_ssid="$2"
+    local callback_script="${3:-}"
+    
+    log "INFO" "Starting network change monitoring"
+    log "INFO" "WiFi Interface: $wifi_interface"
+    log "INFO" "Target SSID: $target_ssid"
+    
+    local last_ssid=""
+    local last_state=""
+    
+    while true; do
+        local current_ssid
+        current_ssid=$(get_current_ssid "$wifi_interface")
+        
+        local current_state="disconnected"
+        if [[ "$current_ssid" == "$target_ssid" ]]; then
+            current_state="connected"
+        fi
+        
+        # Check for state change
+        if [[ "$current_state" != "$last_state" ]]; then
+            log "INFO" "Network state changed: $last_state -> $current_state (SSID: $current_ssid)"
+            
+            # Call callback script if provided
+            if [[ -n "$callback_script" && -x "$callback_script" ]]; then
+                log "INFO" "Calling callback script: $callback_script"
+                "$callback_script" "$current_state" "$wifi_interface" "$current_ssid" || log "ERROR" "Callback script failed"
+            fi
+            
+            last_state="$current_state"
+        fi
+        
+        # Update last known SSID
+        last_ssid="$current_ssid"
+        
+        sleep 2
+    done
+}
+
+# Test network connectivity
+test_connectivity() {
+    local wifi_interface="$1"
+    local test_destinations="${2:-8.8.8.8 1.1.1.1}"
+    
+    echo "=== Connectivity Test ==="
+    echo "Interface: $wifi_interface"
+    echo "Test destinations: $test_destinations"
+    echo ""
+    
+    for dest in $test_destinations; do
+        echo -n "Testing $dest: "
+        
+        # Test general connectivity
+        if ping -c 1 -t 2 "$dest" >/dev/null 2>&1; then
+            echo "OK (general)"
+        else
+            echo "FAIL (general)"
+            continue
+        fi
+        
+        # Test via specific interface (if supported)
+        echo -n "  via $wifi_interface: "
+        if ping -c 1 -t 2 -b "$wifi_interface" "$dest" >/dev/null 2>&1; then
+            echo "OK"
+        else
+            echo "FAIL or not supported"
+        fi
+    done
+    
+    echo ""
+}
+
+# Watch for specific SSID connection
+watch_ssid() {
+    local wifi_interface="$1"
+    local target_ssid="$2"
+    
+    log "INFO" "Watching for connection to SSID: $target_ssid"
+    
+    while true; do
+        local current_ssid
+        current_ssid=$(get_current_ssid "$wifi_interface")
+        
+        if [[ "$current_ssid" == "$target_ssid" ]]; then
+            log "INFO" "Connected to target SSID: $target_ssid"
+            return 0
+        fi
+        
+        sleep 2
+    done
+}
+
+# Show available WiFi networks
+show_wifi_networks() {
+    local wifi_interface="$1"
+    
+    echo "=== Available WiFi Networks ==="
+    echo "Scanning with interface: $wifi_interface"
+    echo ""
+    
+    # Scan for networks (this may take a few seconds)
+    if /System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport -s 2>/dev/null; then
+        echo ""
+        echo "Scan completed successfully"
+    else
+        echo "WiFi scan failed or airport utility not available"
+        echo "You can also check available networks in System Preferences > Network"
+    fi
+}
+
+# Main execution
+main() {
+    local action="${1:-}"
+    local wifi_interface="${2:-}"
+    local target_ssid="${3:-}"
+    local callback_script="${4:-}"
+    
+    # Auto-detect WiFi interface if not provided
+    if [[ -z "$wifi_interface" ]]; then
+        wifi_interface=$(get_wifi_interface)
+        if [[ -z "$wifi_interface" ]]; then
+            echo "ERROR: Could not detect WiFi interface"
+            exit 1
+        fi
+    fi
+    
+    case "$action" in
+        monitor)
+            if [[ -z "$target_ssid" ]]; then
+                echo "Usage: $0 monitor [wifi_interface] <target_ssid> [callback_script]"
+                exit 1
+            fi
+            monitor_changes "$wifi_interface" "$target_ssid" "$callback_script"
+            ;;
+        status)
+            get_network_state "$wifi_interface"
+            ;;
+        test)
+            test_connectivity "$wifi_interface" "${target_ssid:-8.8.8.8 1.1.1.1}"
+            ;;
+        watch)
+            if [[ -z "$target_ssid" ]]; then
+                echo "Usage: $0 watch [wifi_interface] <target_ssid>"
+                exit 1
+            fi
+            watch_ssid "$wifi_interface" "$target_ssid"
+            ;;
+        scan)
+            show_wifi_networks "$wifi_interface"
+            ;;
+        ssid)
+            current_ssid=$(get_current_ssid "$wifi_interface")
+            echo "Current SSID: ${current_ssid:-Not connected}"
+            ;;
+        interface)
+            echo "WiFi Interface: $wifi_interface"
+            ;;
+        *)
+            echo "Usage: $0 {monitor|status|test|watch|scan|ssid|interface} [wifi_interface] [additional_args]"
+            echo ""
+            echo "Actions:"
+            echo "  monitor [interface] <ssid> [callback]  - Monitor for SSID connection changes"
+            echo "  status [interface]                     - Show current network status"
+            echo "  test [interface] [destinations]        - Test network connectivity"
+            echo "  watch [interface] <ssid>               - Wait for connection to specific SSID"
+            echo "  scan [interface]                       - Scan for available WiFi networks"
+            echo "  ssid [interface]                       - Show current SSID"
+            echo "  interface                              - Show WiFi interface name"
+            echo ""
+            echo "If interface is not specified, it will be auto-detected."
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

@@ -1,0 +1,32 @@
+{
+  "target_ssid": "SOME-SSID",
+  "wifi_interface": "auto",
+  "security_layers": {
+    "firewall": true,
+    "routing": true
+  },
+  "firewall_config": {
+    "block_by_default": true,
+    "log_blocked_traffic": true,
+    "allow_system_traffic": ["dhcp", "link-local"]
+  },
+  "prefixes": {
+    "config_file": "config/prefixes.conf",
+    "include_rfc1918": true,
+    "exclude_ranges": [
+      "10.219.0.0/16",
+      "10.52.0.0/16", 
+      "172.16.0.0/16",
+      "192.168.1.0/24"
+    ]
+  },
+  "monitoring": {
+    "route_check_interval": 5,
+    "log_file": "logs/wifi-daemon.log",
+    "backup_directory": "backups"
+  },
+  "safety": {
+    "max_retry_attempts": 3,
+    "rollback_timeout": 30
+  }
+}

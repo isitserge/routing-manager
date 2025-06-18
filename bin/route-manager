@@ -1,0 +1,537 @@
+#!/bin/bash
+
+# macOS Routing Manager - Route Manager
+# Manages routing table for WiFi interface isolation
+
+set -euo pipefail
+
+# Configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+LOG_DIR="${PROJECT_DIR}/logs"
+BACKUP_DIR="${PROJECT_DIR}/backups"
+STATE_DIR="${PROJECT_DIR}/state"
+
+# Ensure directories exist
+mkdir -p "$LOG_DIR" "$BACKUP_DIR" "$STATE_DIR"
+
+# Logging function
+log() {
+    local level="$1"
+    shift
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ROUTE] [$level] $*" | tee -a "$LOG_DIR/wifi-daemon.log"
+}
+
+# Backup current routing state
+backup_routes() {
+    local backup_file="${BACKUP_DIR}/routes-backup-$(date +%s).txt"
+    local default_backup="${BACKUP_DIR}/default-route-backup-$(date +%s).txt"
+    
+    log "INFO" "Backing up current routing table"
+    
+    # Backup full routing table
+    if netstat -rn > "$backup_file" 2>/dev/null; then
+        log "INFO" "Routing table backed up to $backup_file"
+    else
+        log "ERROR" "Failed to backup routing table"
+        return 1
+    fi
+    
+    # Backup current default route specifically
+    if route -n get default > "$default_backup" 2>/dev/null; then
+        log "INFO" "Default route backed up to $default_backup"
+    else
+        log "WARN" "Could not backup default route"
+    fi
+    
+    echo "$backup_file"
+}
+
+# Get current default route info
+get_default_route_info() {
+    local default_gateway
+    local default_interface
+    
+    default_gateway=$(route -n get default 2>/dev/null | grep gateway | awk '{print $2}' || echo "")
+    default_interface=$(route -n get default 2>/dev/null | grep interface | awk '{print $2}' || echo "")
+    
+    if [[ -n "$default_gateway" && -n "$default_interface" ]]; then
+        echo "$default_gateway $default_interface"
+    else
+        echo ""
+    fi
+}
+
+# Store default route info for restoration
+store_default_route() {
+    local route_info="$1"
+    local state_file="${STATE_DIR}/original-default-route.txt"
+    
+    if [[ -n "$route_info" ]]; then
+        echo "$route_info" > "$state_file"
+        log "INFO" "Stored original default route: $route_info"
+    else
+        log "WARN" "No default route info to store"
+    fi
+}
+
+# Restore original default route
+restore_default_route() {
+    local state_file="${STATE_DIR}/original-default-route.txt"
+    
+    if [[ -f "$state_file" ]]; then
+        local route_info
+        route_info=$(cat "$state_file")
+        local gateway interface
+        read -r gateway interface <<< "$route_info"
+        
+        log "INFO" "Restoring original default route: $gateway via $interface"
+        
+        # Check if default route exists and is correct
+        local current_default
+        current_default=$(get_default_route_info)
+        
+        if [[ "$current_default" != "$route_info" ]]; then
+            # Remove incorrect default route if it exists
+            route delete default >/dev/null 2>&1 || true
+            
+            # Add correct default route
+            if route add default "$gateway" -ifscope "$interface" 2>/dev/null; then
+                log "INFO" "Restored default route successfully"
+            else
+                log "ERROR" "Failed to restore default route"
+                return 1
+            fi
+        else
+            log "INFO" "Default route already correct"
+        fi
+        
+        # Clean up state file
+        rm -f "$state_file"
+    else
+        log "WARN" "No stored default route found"
+    fi
+}
+
+# Remove WiFi default route
+remove_wifi_default() {
+    local wifi_interface="$1"
+    
+    log "INFO" "Removing default route from WiFi interface $wifi_interface"
+    
+    # Check if WiFi has a default route
+    if route -n get default -ifscope "$wifi_interface" >/dev/null 2>&1; then
+        log "INFO" "Found default route on $wifi_interface, removing..."
+        
+        if route delete default -ifscope "$wifi_interface" 2>/dev/null; then
+            log "INFO" "Removed default route from $wifi_interface"
+        else
+            log "ERROR" "Failed to remove default route from $wifi_interface"
+            return 1
+        fi
+    else
+        log "INFO" "No default route found on $wifi_interface"
+    fi
+    
+    return 0
+}
+
+# Calculate subnet cutouts to avoid exclusions using Python subnet calculator
+calculate_subnet_cutouts() {
+    local network="$1"
+    local exclusions=("${@:2}")
+    
+    # Use the Python subnet calculator for precise calculations
+    local calculator_path="${SCRIPT_DIR}/subnet-calculator.py"
+    
+    if [[ ! -x "$calculator_path" ]]; then
+        log "ERROR" "Python subnet calculator not found or not executable: $calculator_path"
+        # Fallback to original network if calculator unavailable
+        echo "$network"
+        return 1
+    fi
+    
+    # Call Python calculator with network and all exclusions
+    if ! "$calculator_path" "$network" "${exclusions[@]}" 2>/dev/null; then
+        log "ERROR" "Python subnet calculator failed for network $network"
+        # Fallback to original network if calculation fails
+        echo "$network"
+        return 1
+    fi
+}
+
+# Clean up existing cutout routes that might conflict
+cleanup_existing_cutouts() {
+    local prefixes_file="$1"
+    
+    log "INFO" "Cleaning up existing cutout routes and conflicting routes"
+    
+    local routes_removed=0
+    
+    # First, remove any 169.254.0.0/16 (link-local) routes that might interfere
+    while IFS= read -r route_line; do
+        if [[ "$route_line" =~ ^169\.254 ]]; then
+            local route_dest=$(echo "$route_line" | awk '{print $1}')
+            log "INFO" "Removing link-local route: $route_dest"
+            if route delete -net "$route_dest" 2>/dev/null; then
+                ((routes_removed++))
+            else
+                log "WARN" "Failed to remove link-local route: $route_dest"
+            fi
+        fi
+    done < <(netstat -rn | grep -E "^169\.254")
+    
+    # Collect included networks and exclusions
+    local included_networks=()
+    local excluded_networks=()
+    
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// }" ]] && continue
+        
+        if [[ "$line" =~ ^! ]]; then
+            excluded_networks+=("${line#!}")
+        else
+            included_networks+=("$line")
+        fi
+    done < "$prefixes_file"
+    
+    # For each network, calculate cutouts and remove any existing routes
+    for network in "${included_networks[@]}"; do
+        while IFS= read -r subnet; do
+            [[ -z "$subnet" ]] && continue
+            
+            # Check if this route exists and remove it
+            if route -n get -net "$subnet" >/dev/null 2>&1; then
+                log "INFO" "Removing existing cutout route: $subnet"
+                if route delete -net "$subnet" 2>/dev/null; then
+                    ((routes_removed++))
+                else
+                    log "WARN" "Failed to remove existing cutout route: $subnet"
+                fi
+            fi
+        done < <(calculate_subnet_cutouts "$network" "${excluded_networks[@]}")
+    done
+    
+    log "INFO" "Removed $routes_removed conflicting routes"
+}
+
+# Add specific prefix routes through WiFi with proper exclusion handling
+add_prefix_routes() {
+    local wifi_interface="$1"
+    local wifi_gateway="$2"
+    local prefixes_file="$3"
+    
+    log "INFO" "Adding prefix routes through $wifi_interface via $wifi_gateway"
+    
+    # Clean up any existing cutout routes first
+    cleanup_existing_cutouts "$prefixes_file"
+    
+    local routes_added=0
+    local routes_failed=0
+    
+    # First pass: collect included networks and exclusions
+    local included_networks=()
+    local excluded_networks=()
+    
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// }" ]] && continue
+        
+        if [[ "$line" =~ ^! ]]; then
+            excluded_networks+=("${line#!}")
+        else
+            included_networks+=("$line")
+        fi
+    done < "$prefixes_file"
+    
+    log "INFO" "Found ${#included_networks[@]} included networks, ${#excluded_networks[@]} exclusions"
+    
+    # Second pass: calculate and install proper subnet cutouts
+    for network in "${included_networks[@]}"; do
+        log "INFO" "Processing network: $network"
+        
+        # Calculate and install each cutout subnet
+        while IFS= read -r subnet; do
+            [[ -z "$subnet" ]] && continue
+            
+            log "INFO" "Adding route for subnet cutout: $subnet via $wifi_gateway on $wifi_interface"
+            
+            if route add -net "$subnet" "$wifi_gateway" 2>/dev/null; then
+                log "INFO" "Successfully added route: $subnet -> $wifi_gateway ($wifi_interface)"
+                ((routes_added++))
+            else
+                log "ERROR" "Failed to add route: $subnet -> $wifi_gateway ($wifi_interface)"
+                ((routes_failed++))
+            fi
+        done < <(calculate_subnet_cutouts "$network" "${excluded_networks[@]}")
+    done
+    
+    log "INFO" "Route addition complete: $routes_added added, $routes_failed failed"
+    
+    if [[ $routes_failed -eq 0 ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+
+# Configure routing for WiFi interface
+configure_routes() {
+    local wifi_interface="$1"
+    local wifi_gateway="$2"
+    local prefixes_file="$3"
+    
+    log "INFO" "Configuring routes for $wifi_interface"
+    
+    # Backup current routes
+    local backup_file
+    backup_file=$(backup_routes)
+    
+    # Store original default route
+    local original_default
+    original_default=$(get_default_route_info)
+    store_default_route "$original_default"
+    
+    # Remove WiFi default route
+    if ! remove_wifi_default "$wifi_interface"; then
+        log "ERROR" "Failed to remove WiFi default route"
+        return 1
+    fi
+    
+    # Ensure original default route is preserved
+    if [[ -n "$original_default" ]]; then
+        local gateway interface
+        read -r gateway interface <<< "$original_default"
+        
+        # Only restore if current default route is missing or wrong
+        local current_default
+        current_default=$(get_default_route_info)
+        
+        if [[ -z "$current_default" ]] || [[ "$current_default" != "$original_default" ]]; then
+            log "INFO" "Restoring original default route: $gateway via $interface"
+            route delete default >/dev/null 2>&1 || true
+            route add default "$gateway" -ifscope "$interface" 2>/dev/null || true
+        fi
+    fi
+    
+    # Add specific prefix routes
+    if ! add_prefix_routes "$wifi_interface" "$wifi_gateway" "$prefixes_file"; then
+        log "ERROR" "Failed to add some prefix routes"
+        return 1
+    fi
+    
+    log "INFO" "Route configuration completed successfully"
+    return 0
+}
+
+# Clean up WiFi routes
+cleanup_routes() {
+    local wifi_interface="$1"
+    local prefixes_file="$2"
+    
+    log "INFO" "Cleaning up routes for $wifi_interface"
+    
+    local routes_removed=0
+    
+    # Collect included networks and exclusions (same as configuration)
+    local included_networks=()
+    local excluded_networks=()
+    
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// }" ]] && continue
+        
+        if [[ "$line" =~ ^! ]]; then
+            excluded_networks+=("${line#!}")
+        else
+            included_networks+=("$line")
+        fi
+    done < "$prefixes_file"
+    
+    # Remove the actual subnet cutout routes that were installed
+    for network in "${included_networks[@]}"; do
+        log "INFO" "Removing cutout routes for network: $network"
+        
+        # Calculate and remove each cutout subnet (same as was installed)
+        while IFS= read -r subnet; do
+            [[ -z "$subnet" ]] && continue
+            
+            log "INFO" "Removing cutout route: $subnet from $wifi_interface"
+            
+            # Try removing with various methods to handle different route states
+            if route delete -net "$subnet" 2>/dev/null; then
+                log "INFO" "Removed cutout route: $subnet"
+                ((routes_removed++))
+            elif route delete -net "$subnet" -ifscope "$wifi_interface" 2>/dev/null; then
+                log "INFO" "Removed scoped cutout route: $subnet"
+                ((routes_removed++))
+            else
+                log "DEBUG" "Cutout route not found or already removed: $subnet"
+            fi
+        done < <(calculate_subnet_cutouts "$network" "${excluded_networks[@]}")
+    done
+    
+    log "INFO" "Removed $routes_removed cutout routes"
+    
+    # Restore original default route if stored
+    restore_default_route
+    
+    log "INFO" "Route cleanup completed"
+}
+
+# Show current routing status
+show_status() {
+    local wifi_interface="$1"
+    
+    echo "=== Routing Status ==="
+    
+    # Show default route
+    echo "Default route:"
+    route -n get default 2>/dev/null || echo "No default route found"
+    
+    echo ""
+    echo "Routes via $wifi_interface:"
+    netstat -rn | grep "$wifi_interface" || echo "No routes found"
+    
+    echo ""
+    echo "WiFi interface status:"
+    ifconfig "$wifi_interface" 2>/dev/null | grep "inet " || echo "Interface not configured"
+}
+
+# Verify routing configuration
+verify_routes() {
+    local wifi_interface="$1"
+    local prefixes_file="$2"
+    local test_prefix="${3:-10.1.1.1}"
+    
+    log "INFO" "Verifying routing configuration for $wifi_interface"
+    
+    # Check that default route is NOT via WiFi
+    local default_interface
+    default_interface=$(route -n get default 2>/dev/null | grep interface | awk '{print $2}' || echo "")
+    
+    if [[ "$default_interface" == "$wifi_interface" ]]; then
+        log "ERROR" "Default route is via WiFi interface $wifi_interface - this should not happen!"
+        return 1
+    else
+        log "INFO" "Default route is NOT via WiFi interface (current: $default_interface)"
+    fi
+    
+    # Check that configured prefixes route via WiFi
+    local test_route_interface
+    test_route_interface=$(route -n get "$test_prefix" 2>/dev/null | grep interface | awk '{print $2}' || echo "")
+    
+    if [[ "$test_route_interface" == "$wifi_interface" ]]; then
+        log "INFO" "Test prefix $test_prefix routes via WiFi interface as expected"
+    else
+        log "WARN" "Test prefix $test_prefix does not route via WiFi interface (current: $test_route_interface)"
+    fi
+    
+    # Count routes via WiFi interface
+    local route_count
+    route_count=$(netstat -rn | grep -c "$wifi_interface" || echo "0")
+    log "INFO" "Found $route_count routes via $wifi_interface"
+    
+    return 0
+}
+
+# Test subnet cutout calculation (dry-run)
+test_cutouts() {
+    local prefixes_file="${1:-config/prefixes.conf}"
+    
+    log "INFO" "Testing subnet cutout calculation (dry-run mode)"
+    
+    # Collect included networks and exclusions
+    local included_networks=()
+    local excluded_networks=()
+    
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// }" ]] && continue
+        
+        if [[ "$line" =~ ^! ]]; then
+            excluded_networks+=("${line#!}")
+        else
+            included_networks+=("$line")
+        fi
+    done < "$prefixes_file"
+    
+    echo "=== SUBNET CUTOUT TEST ==="
+    echo "Included networks: ${included_networks[*]}"
+    echo "Excluded networks: ${excluded_networks[*]}"
+    echo ""
+    
+    # Test cutouts for each network
+    for network in "${included_networks[@]}"; do
+        echo "Network: $network"
+        echo "Calculated cutouts:"
+        
+        while IFS= read -r subnet; do
+            [[ -z "$subnet" ]] && continue
+            echo "  → $subnet"
+        done < <(calculate_subnet_cutouts "$network" "${excluded_networks[@]}")
+        echo ""
+    done
+}
+# Main execution
+main() {
+    local action="${1:-}"
+    local wifi_interface="${2:-}"
+    local wifi_gateway="${3:-}"
+    local prefixes_file="${4:-}"
+    
+    case "$action" in
+        configure)
+            if [[ -z "$wifi_interface" || -z "$wifi_gateway" || -z "$prefixes_file" ]]; then
+                echo "Usage: $0 configure <wifi_interface> <wifi_gateway> <prefixes_file>"
+                exit 1
+            fi
+            configure_routes "$wifi_interface" "$wifi_gateway" "$prefixes_file"
+            ;;
+        cleanup)
+            local cleanup_prefixes_file="${3:-}"  # For cleanup, arg 3 is prefixes_file
+            if [[ -z "$wifi_interface" || -z "$cleanup_prefixes_file" ]]; then
+                echo "Usage: $0 cleanup <wifi_interface> <prefixes_file>"
+                exit 1
+            fi
+            cleanup_routes "$wifi_interface" "$cleanup_prefixes_file"
+            ;;
+        status)
+            if [[ -z "$wifi_interface" ]]; then
+                echo "Usage: $0 status <wifi_interface>"
+                exit 1
+            fi
+            show_status "$wifi_interface"
+            ;;
+        verify)
+            if [[ -z "$wifi_interface" || -z "$prefixes_file" ]]; then
+                echo "Usage: $0 verify <wifi_interface> <prefixes_file> [test_prefix]"
+                exit 1
+            fi
+            verify_routes "$wifi_interface" "$prefixes_file" "${4:-10.1.1.1}"
+            ;;
+        backup)
+            backup_routes
+            ;;
+        test-cutouts)
+            local test_prefixes_file="${2:-config/prefixes.conf}"
+            test_cutouts "$test_prefixes_file"
+            ;;
+        *)
+            echo "Usage: $0 {configure|cleanup|status|verify|backup|test-cutouts} <wifi_interface> [additional_args]"
+            echo ""
+            echo "Actions:"
+            echo "  configure <interface> <gateway> <prefixes_file>  - Configure WiFi routes"
+            echo "  cleanup <interface> <prefixes_file>              - Clean up WiFi routes"
+            echo "  status <interface>                               - Show routing status"
+            echo "  verify <interface> <prefixes_file> [test_prefix] - Verify routing config"
+            echo "  backup                                           - Backup current routes"
+            echo "  test-cutouts [prefixes_file]                     - Test subnet cutout calculation"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

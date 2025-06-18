@@ -1,0 +1,286 @@
+#!/bin/bash
+
+# macOS Routing Manager - Firewall Manager
+# Manages pfctl firewall rules for WiFi interface isolation
+
+set -euo pipefail
+
+# Configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+LOG_DIR="${PROJECT_DIR}/logs"
+BACKUP_DIR="${PROJECT_DIR}/backups"
+
+# Ensure directories exist
+mkdir -p "$LOG_DIR" "$BACKUP_DIR"
+
+# Logging function
+log() {
+    local level="$1"
+    shift
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [FIREWALL] [$level] $*" | tee -a "$LOG_DIR/wifi-daemon.log"
+}
+
+# Generate firewall rules from prefix configuration
+generate_rules() {
+    local wifi_interface="$1"
+    local prefixes_file="$2"
+    local pf_file="${PROJECT_DIR}/config/pf-wifi.conf"
+    
+    log "INFO" "Generating firewall rules for interface $wifi_interface"
+    
+    # Create firewall configuration header
+    cat > "$pf_file" << EOF
+# Auto-generated WiFi isolation rules for SOME-SSID
+# Generated on $(date)
+# Interface: $wifi_interface
+
+# Block all outbound traffic on WiFi interface by default
+block out on $wifi_interface all
+
+EOF
+    
+    # Process prefix configuration file
+    while IFS= read -r line; do
+        # Skip comments and empty lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// }" ]] && continue
+        
+        # Handle excluded prefixes (lines starting with !)
+        if [[ "$line" =~ ^! ]]; then
+            local excluded_prefix="${line#!}"
+            echo "# Block excluded prefix: $excluded_prefix"
+            echo "block out on $wifi_interface to $excluded_prefix"
+            echo ""
+        else
+            # Include prefix - allow traffic to this destination
+            echo "# Allow traffic to: $line"
+            echo "pass out on $wifi_interface to $line"
+            echo ""
+        fi
+    done < "$prefixes_file" >> "$pf_file"
+    
+    # Add essential system traffic rules
+    cat >> "$pf_file" << EOF
+
+# Essential system traffic
+pass out on $wifi_interface to 169.254.0.0/16  # Link-local
+pass out on $wifi_interface proto udp to any port 53  # DNS (if needed locally)
+pass out on $wifi_interface proto udp to any port 67  # DHCP client
+pass out on $wifi_interface proto udp to any port 68  # DHCP client
+
+# Log all blocked traffic for monitoring
+block log on $wifi_interface all
+
+EOF
+    
+    log "INFO" "Generated firewall rules in $pf_file"
+    return 0
+}
+
+# Backup current pfctl rules
+backup_rules() {
+    local backup_file="${BACKUP_DIR}/pf-backup-$(date +%s).conf"
+    
+    log "INFO" "Backing up current firewall rules"
+    
+    if pfctl -sr > "$backup_file" 2>/dev/null; then
+        log "INFO" "Firewall rules backed up to $backup_file"
+        echo "$backup_file"
+    else
+        log "WARN" "Could not backup firewall rules (pfctl may not be enabled)"
+        echo ""
+    fi
+}
+
+# Apply firewall rules
+apply_rules() {
+    local wifi_interface="$1"
+    local pf_file="${PROJECT_DIR}/config/pf-wifi.conf"
+    
+    if [[ ! -f "$pf_file" ]]; then
+        log "ERROR" "Firewall rules file not found: $pf_file"
+        return 1
+    fi
+    
+    log "INFO" "Applying firewall rules for interface $wifi_interface"
+    
+    # Backup existing rules
+    local backup_file
+    backup_file=$(backup_rules)
+    
+    # Test rule syntax first
+    if ! pfctl -nf "$pf_file" 2>/dev/null; then
+        log "ERROR" "Firewall rules syntax check failed"
+        return 1
+    fi
+    
+    # Load and enable firewall rules
+    if pfctl -f "$pf_file" 2>/dev/null; then
+        log "INFO" "Firewall rules loaded successfully"
+    else
+        log "ERROR" "Failed to load firewall rules"
+        return 1
+    fi
+    
+    # Enable packet filtering
+    if pfctl -e 2>/dev/null; then
+        log "INFO" "Packet filtering enabled"
+    else
+        log "WARN" "Could not enable packet filtering (may already be enabled)"
+    fi
+    
+    # Verify rules are active
+    if pfctl -s rules | grep -q "$wifi_interface"; then
+        log "INFO" "Firewall rules for $wifi_interface are active"
+        return 0
+    else
+        log "ERROR" "Firewall rules for $wifi_interface not found in active ruleset"
+        return 1
+    fi
+}
+
+# Remove WiFi-specific firewall rules
+remove_rules() {
+    local wifi_interface="$1"
+    
+    log "INFO" "Removing firewall rules for interface $wifi_interface"
+    
+    # Check if we have rules for this interface
+    if ! pfctl -s rules 2>/dev/null | grep -q "$wifi_interface"; then
+        log "INFO" "No firewall rules found for interface $wifi_interface"
+        return 0
+    fi
+    
+    # For safety, we'll flush all rules and disable pfctl
+    # In a production environment, you might want more selective removal
+    log "WARN" "Flushing all firewall rules and disabling packet filtering"
+    
+    if pfctl -F rules 2>/dev/null; then
+        log "INFO" "Flushed all firewall rules"
+    else
+        log "ERROR" "Failed to flush firewall rules"
+        return 1
+    fi
+    
+    if pfctl -d 2>/dev/null; then
+        log "INFO" "Disabled packet filtering"
+    else
+        log "WARN" "Could not disable packet filtering (may already be disabled)"
+    fi
+    
+    return 0
+}
+
+# Show current firewall status
+show_status() {
+    local wifi_interface="$1"
+    
+    echo "=== Firewall Status ==="
+    
+    # Check if pfctl is enabled
+    if pfctl -s info 2>/dev/null | grep -q "Status: Enabled"; then
+        echo "Packet filtering: Enabled"
+    else
+        echo "Packet filtering: Disabled"
+    fi
+    
+    # Show rules for WiFi interface
+    echo ""
+    echo "Rules for interface $wifi_interface:"
+    pfctl -s rules 2>/dev/null | grep "$wifi_interface" || echo "No rules found"
+    
+    # Show rule statistics
+    echo ""
+    echo "Rule statistics:"
+    pfctl -s rules -v 2>/dev/null | grep -A 2 "$wifi_interface" || echo "No statistics available"
+}
+
+# Verify firewall configuration
+verify_rules() {
+    local wifi_interface="$1"
+    local test_destination="${2:-8.8.8.8}"
+    
+    log "INFO" "Verifying firewall rules for interface $wifi_interface"
+    
+    # Check if rules are loaded
+    local rule_count
+    rule_count=$(pfctl -s rules 2>/dev/null | grep -c "$wifi_interface" || echo "0")
+    
+    if [[ "$rule_count" -eq 0 ]]; then
+        log "ERROR" "No firewall rules found for interface $wifi_interface"
+        return 1
+    fi
+    
+    log "INFO" "Found $rule_count firewall rules for interface $wifi_interface"
+    
+    # Test if traffic to unauthorized destination is blocked
+    log "INFO" "Testing traffic blocking to $test_destination"
+    
+    # This is a logical test - actual traffic testing would require more complex setup
+    if pfctl -s rules | grep -q "block.*$wifi_interface"; then
+        log "INFO" "Block rules are active for interface $wifi_interface"
+        return 0
+    else
+        log "WARN" "No block rules found for interface $wifi_interface"
+        return 1
+    fi
+}
+
+# Main execution
+main() {
+    local action="${1:-}"
+    local wifi_interface="${2:-}"
+    local prefixes_file="${3:-}"
+    
+    case "$action" in
+        generate)
+            if [[ -z "$wifi_interface" || -z "$prefixes_file" ]]; then
+                echo "Usage: $0 generate <wifi_interface> <prefixes_file>"
+                exit 1
+            fi
+            generate_rules "$wifi_interface" "$prefixes_file"
+            ;;
+        apply)
+            if [[ -z "$wifi_interface" ]]; then
+                echo "Usage: $0 apply <wifi_interface>"
+                exit 1
+            fi
+            apply_rules "$wifi_interface"
+            ;;
+        remove)
+            if [[ -z "$wifi_interface" ]]; then
+                echo "Usage: $0 remove <wifi_interface>"
+                exit 1
+            fi
+            remove_rules "$wifi_interface"
+            ;;
+        status)
+            if [[ -z "$wifi_interface" ]]; then
+                echo "Usage: $0 status <wifi_interface>"
+                exit 1
+            fi
+            show_status "$wifi_interface"
+            ;;
+        verify)
+            if [[ -z "$wifi_interface" ]]; then
+                echo "Usage: $0 verify <wifi_interface> [test_destination]"
+                exit 1
+            fi
+            verify_rules "$wifi_interface" "${3:-8.8.8.8}"
+            ;;
+        *)
+            echo "Usage: $0 {generate|apply|remove|status|verify} <wifi_interface> [additional_args]"
+            echo ""
+            echo "Actions:"
+            echo "  generate <interface> <prefixes_file>  - Generate firewall rules"
+            echo "  apply <interface>                     - Apply firewall rules"
+            echo "  remove <interface>                    - Remove firewall rules"
+            echo "  status <interface>                    - Show firewall status"
+            echo "  verify <interface> [destination]      - Verify firewall rules"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

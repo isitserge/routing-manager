@@ -1,0 +1,21 @@
+# macOS routing manager
+*.log
+*.tmp
+/tmp/
+/logs/
+/backups/
+
+# System files
+.DS_Store
+._*
+
+# Runtime files
+*.pid
+*.sock
+*.state
+
+# Generated configuration
+pf-wifi.conf
+
+# Test outputs
+test-results/

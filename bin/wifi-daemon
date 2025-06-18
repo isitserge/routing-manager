@@ -1,0 +1,291 @@
+#!/bin/bash
+
+# macOS Routing Manager - Main Daemon
+# Monitors WiFi connections and manages routing/firewall rules
+
+set -euo pipefail
+
+# Configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+CONFIG_FILE="${PROJECT_DIR}/config/config.json"
+PREFIXES_FILE="${PROJECT_DIR}/config/prefixes.conf"
+LOG_DIR="${PROJECT_DIR}/logs"
+BACKUP_DIR="${PROJECT_DIR}/backups"
+STATE_DIR="${PROJECT_DIR}/state"
+
+# Ensure directories exist
+mkdir -p "$LOG_DIR" "$BACKUP_DIR" "$STATE_DIR"
+
+# Global variables
+TARGET_SSID=""
+WIFI_INTERFACE=""
+USE_FIREWALL=""
+USE_ROUTING=""
+CHECK_INTERVAL=""
+
+# Logging function
+log() {
+    local level="$1"
+    shift
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $*" | tee -a "$LOG_DIR/wifi-daemon.log"
+}
+
+# Load configuration
+load_config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        log "ERROR" "Configuration file not found: $CONFIG_FILE"
+        exit 1
+    fi
+    
+    TARGET_SSID=$(jq -r '.target_ssid' "$CONFIG_FILE")
+    WIFI_INTERFACE=$(jq -r '.wifi_interface' "$CONFIG_FILE")
+    USE_FIREWALL=$(jq -r '.security_layers.firewall' "$CONFIG_FILE")
+    USE_ROUTING=$(jq -r '.security_layers.routing' "$CONFIG_FILE")
+    CHECK_INTERVAL=$(jq -r '.monitoring.route_check_interval' "$CONFIG_FILE")
+    
+    log "INFO" "Loaded configuration - Target SSID: $TARGET_SSID, WiFi Interface: $WIFI_INTERFACE"
+}
+
+# Detect WiFi interface if set to auto
+detect_wifi_interface() {
+    if [[ "$WIFI_INTERFACE" == "auto" ]]; then
+        WIFI_INTERFACE=$(networksetup -listallhardwareports | grep -A 1 "Wi-Fi" | grep "Device:" | awk '{print $2}' | head -n 1)
+        if [[ -z "$WIFI_INTERFACE" ]]; then
+            log "ERROR" "Could not auto-detect WiFi interface"
+            exit 1
+        fi
+        log "INFO" "Auto-detected WiFi interface: $WIFI_INTERFACE"
+    fi
+}
+
+# Get current SSID using system_profiler (most reliable method)
+get_current_ssid() {
+    local ssid=""
+    
+    # Primary method: system_profiler (most reliable)
+    ssid=$(system_profiler SPAirPortDataType 2>/dev/null | \
+           grep -A 10 "Current Network Information:" | \
+           grep -E "^[[:space:]]+[A-Za-z0-9-]+:" | \
+           head -1 | \
+           sed 's/://g' | \
+           xargs)
+    
+    # Fallback: airport utility if available and system_profiler fails
+    if [[ -z "$ssid" ]] && command -v /System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport >/dev/null 2>&1; then
+        ssid=$(/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport -I 2>/dev/null | \
+               grep " SSID" | \
+               cut -d: -f2 | \
+               xargs)
+    fi
+    
+    echo "$ssid"
+}
+
+# Check if connected to target SSID
+is_connected_to_target() {
+    local current_ssid
+    current_ssid=$(get_current_ssid)
+    
+    # Debug logging
+    log "DEBUG" "Current SSID: '${current_ssid}' (length: ${#current_ssid})"
+    log "DEBUG" "Target SSID: '${TARGET_SSID}' (length: ${#TARGET_SSID})"
+    
+    # Return success if SSIDs match
+    [[ "$current_ssid" == "$TARGET_SSID" ]]
+}
+
+# Get WiFi gateway
+get_wifi_gateway() {
+    local gateway
+    gateway=$(route -n get default -ifscope "$WIFI_INTERFACE" 2>/dev/null | grep gateway | awk '{print $2}')
+    echo "${gateway:-}"
+}
+
+# Test gateway connectivity
+test_gateway() {
+    local gateway="$1"
+    if [[ -n "$gateway" ]]; then
+        ping -c 1 -W 1 "$gateway" &>/dev/null
+    else
+        return 1
+    fi
+}
+
+# Apply routing configuration
+apply_routing_configuration() {
+    local gateway="$1"
+    log "INFO" "Applying routing configuration"
+    
+    if [[ "$USE_ROUTING" == "true" ]]; then
+        if "$SCRIPT_DIR/route-manager" configure "$WIFI_INTERFACE" "$gateway" "$PREFIXES_FILE"; then
+            log "INFO" "Routing configuration applied successfully"
+            return 0
+        else
+            log "ERROR" "Failed to apply routing configuration"
+            return 1
+        fi
+    else
+        log "INFO" "Routing is disabled in configuration"
+        return 0
+    fi
+}
+
+# Apply firewall configuration
+apply_firewall_configuration() {
+    log "INFO" "Applying firewall configuration"
+    
+    if [[ "$USE_FIREWALL" == "true" ]]; then
+        if "$SCRIPT_DIR/firewall-manager" apply "$WIFI_INTERFACE"; then
+            log "INFO" "Firewall configuration applied successfully"
+            return 0
+        else
+            log "ERROR" "Failed to apply firewall configuration"
+            return 1
+        fi
+    else
+        log "INFO" "Firewall is disabled in configuration"
+        return 0
+    fi
+}
+
+# Apply full configuration
+apply_configuration() {
+    local gateway
+    gateway=$(get_wifi_gateway)
+    
+    if [[ -z "$gateway" ]]; then
+        log "WARN" "No gateway found for interface $WIFI_INTERFACE"
+        return 1
+    fi
+    
+    log "INFO" "Gateway detected: $gateway"
+    
+    if ! test_gateway "$gateway"; then
+        log "WARN" "Gateway $gateway is not reachable"
+        return 1
+    fi
+    
+    log "INFO" "Gateway is reachable, applying security configuration"
+    
+    # Apply firewall first (fail-safe approach)
+    if ! apply_firewall_configuration; then
+        log "ERROR" "Firewall configuration failed"
+        return 1
+    fi
+    
+    # Then apply routing
+    if ! apply_routing_configuration "$gateway"; then
+        log "ERROR" "Routing configuration failed - removing firewall rules"
+        remove_configuration
+        return 1
+    fi
+    
+    log "INFO" "Configuration applied successfully"
+    return 0
+}
+
+# Remove all configuration
+remove_configuration() {
+    log "INFO" "Removing all network configuration"
+    
+    if [[ "$USE_FIREWALL" == "true" ]]; then
+        "$SCRIPT_DIR/firewall-manager" remove "$WIFI_INTERFACE" || true
+    fi
+    
+    if [[ "$USE_ROUTING" == "true" ]]; then
+        "$SCRIPT_DIR/route-manager" cleanup "$WIFI_INTERFACE" "$PREFIXES_FILE" || true
+    fi
+    
+    log "INFO" "Configuration removed"
+}
+
+# State file management
+STATE_FILE="${STATE_DIR}/connection_state"
+
+save_state() {
+    local state="$1"
+    echo "$state" > "$STATE_FILE"
+}
+
+get_state() {
+    if [[ -f "$STATE_FILE" ]]; then
+        cat "$STATE_FILE"
+    else
+        echo "disconnected"
+    fi
+}
+
+# Main monitoring loop
+monitor_connection() {
+    local previous_state
+    local current_state
+    
+    log "INFO" "Starting connection monitoring for SSID: $TARGET_SSID"
+    
+    # Initialize state
+    previous_state=$(get_state)
+    
+    while true; do
+        # Check current connection status
+        if is_connected_to_target; then
+            current_state="connected"
+        else
+            current_state="disconnected"
+        fi
+        
+        # Handle state transitions
+        if [[ "$current_state" != "$previous_state" ]]; then
+            log "INFO" "Connection state changed: $previous_state -> $current_state"
+            
+            case "$current_state" in
+                "connected")
+                    log "INFO" "Connected to $TARGET_SSID - applying configuration"
+                    if apply_configuration; then
+                        save_state "$current_state"
+                        previous_state="$current_state"
+                    else
+                        log "ERROR" "Failed to apply configuration"
+                        # Don't update state on failure
+                    fi
+                    ;;
+                    
+                "disconnected")
+                    log "INFO" "Disconnected from $TARGET_SSID - removing configuration"
+                    remove_configuration
+                    save_state "$current_state"
+                    previous_state="$current_state"
+                    ;;
+            esac
+        fi
+        
+        sleep "$CHECK_INTERVAL"
+    done
+}
+
+# Signal handlers
+cleanup_on_exit() {
+    log "INFO" "Daemon shutting down - cleaning up"
+    remove_configuration
+    rm -f "$STATE_FILE"
+    exit 0
+}
+
+trap cleanup_on_exit SIGINT SIGTERM
+
+# Main execution
+main() {
+    log "INFO" "Starting routing manager daemon"
+    
+    # Load configuration
+    load_config
+    
+    # Detect WiFi interface if needed
+    detect_wifi_interface
+    
+    # Start monitoring
+    monitor_connection
+}
+
+# Run main function
+main "$@"
