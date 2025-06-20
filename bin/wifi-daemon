@@ -19,7 +19,6 @@ SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 if [[ "$SCRIPT_DIR" == "/usr/local/lib/wifi-daemon" ]]; then
     # Installed mode - use system paths
     CONFIG_FILE="/etc/wifi-daemon/config.json"
-    PREFIXES_FILE="/etc/wifi-daemon/prefixes.conf"
     LOG_DIR="/var/lib/wifi-daemon/logs"
     BACKUP_DIR="/var/lib/wifi-daemon/backups"
     STATE_DIR="/var/lib/wifi-daemon/state"
@@ -27,7 +26,6 @@ else
     # Development mode - use project paths
     PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
     CONFIG_FILE="${PROJECT_DIR}/config/config.json"
-    PREFIXES_FILE="${PROJECT_DIR}/config/prefixes.conf"
     LOG_DIR="${PROJECT_DIR}/logs"
     BACKUP_DIR="${PROJECT_DIR}/backups"
     STATE_DIR="${PROJECT_DIR}/state"
@@ -48,6 +46,23 @@ log() {
     local level="$1"
     shift
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $*" | tee -a "$LOG_DIR/wifi-daemon.log"
+}
+
+# Generate temporary prefixes file from config.json
+generate_prefixes_file() {
+    local temp_file=$(mktemp)
+    
+    # Extract include ranges from config.json
+    if jq -e '.prefixes.include_ranges' "$CONFIG_FILE" >/dev/null 2>&1; then
+        jq -r '.prefixes.include_ranges[]' "$CONFIG_FILE" >> "$temp_file"
+    fi
+    
+    # Extract exclude ranges from config.json (with ! prefix)
+    if jq -e '.prefixes.exclude_ranges' "$CONFIG_FILE" >/dev/null 2>&1; then
+        jq -r '.prefixes.exclude_ranges[]' "$CONFIG_FILE" | sed 's/^/!/' >> "$temp_file"
+    fi
+    
+    echo "$temp_file"
 }
 
 # Load configuration
@@ -117,7 +132,44 @@ is_connected_to_target() {
 # Get WiFi gateway
 get_wifi_gateway() {
     local gateway
+    
+    # Method 1: Try to get default route scoped to WiFi interface (works when no VPN)
     gateway=$(route -n get default -ifscope "$WIFI_INTERFACE" 2>/dev/null | grep gateway | awk '{print $2}')
+    
+    # Method 2: If that fails, look for the gateway in the routing table based on WiFi network
+    if [[ -z "$gateway" ]]; then
+        # Get WiFi network info
+        local wifi_ip wifi_network
+        wifi_ip=$(ifconfig "$WIFI_INTERFACE" | grep "inet " | grep -v "127.0.0.1" | awk '{print $2}')
+        
+        if [[ -n "$wifi_ip" ]]; then
+            # Extract network prefix (assuming /24, which is most common)
+            wifi_network=$(echo "$wifi_ip" | cut -d. -f1-3)
+            
+            # Look for gateway in routing table - check for .1 gateway first (most common)
+            local test_gateway="${wifi_network}.1"
+            if ping -c 1 -W 1 "$test_gateway" &>/dev/null; then
+                gateway="$test_gateway"
+            else
+                # Look for other gateways in the routing table for this network
+                local potential_gateways
+                potential_gateways=$(netstat -rn | grep "^${wifi_network}\." | grep "$WIFI_INTERFACE" | awk '{print $1}' | grep -v "/32$" | head -3)
+                
+                for test_gw in $potential_gateways; do
+                    if [[ "$test_gw" != "$wifi_ip" ]] && ping -c 1 -W 1 "$test_gw" &>/dev/null; then
+                        gateway="$test_gw"
+                        break
+                    fi
+                done
+            fi
+        fi
+    fi
+    
+    # Method 3: Fallback to networksetup (may not work reliably)
+    if [[ -z "$gateway" ]]; then
+        gateway=$(networksetup -getinfo "Wi-Fi" 2>/dev/null | grep "Router:" | awk '{print $2}')
+    fi
+    
     echo "${gateway:-}"
 }
 
@@ -137,11 +189,15 @@ apply_routing_configuration() {
     log "INFO" "Applying routing configuration"
     
     if [[ "$USE_ROUTING" == "true" ]]; then
-        if "$SCRIPT_DIR/route-manager" configure "$WIFI_INTERFACE" "$gateway" "$PREFIXES_FILE"; then
+        local temp_prefixes
+        temp_prefixes=$(generate_prefixes_file)
+        if "$SCRIPT_DIR/route-manager" configure "$WIFI_INTERFACE" "$gateway" "$temp_prefixes"; then
+            rm -f "$temp_prefixes"
             log "INFO" "Routing configuration applied successfully"
             return 0
         else
             log "ERROR" "Failed to apply routing configuration"
+            rm -f "$temp_prefixes"
             return 1
         fi
     else
@@ -155,11 +211,15 @@ apply_firewall_configuration() {
     log "INFO" "Applying firewall configuration"
     
     if [[ "$USE_FIREWALL" == "true" ]]; then
-        if "$SCRIPT_DIR/firewall-manager" apply "$WIFI_INTERFACE"; then
+        local temp_prefixes
+        temp_prefixes=$(generate_prefixes_file)
+        if "$SCRIPT_DIR/firewall-manager" configure "$WIFI_INTERFACE" "$temp_prefixes"; then
+            rm -f "$temp_prefixes"
             log "INFO" "Firewall configuration applied successfully"
             return 0
         else
             log "ERROR" "Failed to apply firewall configuration"
+            rm -f "$temp_prefixes"
             return 1
         fi
     else
@@ -213,7 +273,10 @@ remove_configuration() {
     fi
     
     if [[ "$USE_ROUTING" == "true" ]]; then
-        "$SCRIPT_DIR/route-manager" cleanup "$WIFI_INTERFACE" "$PREFIXES_FILE" || true
+        local temp_prefixes
+        temp_prefixes=$(generate_prefixes_file)
+        "$SCRIPT_DIR/route-manager" cleanup "$WIFI_INTERFACE" "$temp_prefixes" || true
+        rm -f "$temp_prefixes"
     fi
     
     log "INFO" "Configuration removed"
@@ -318,10 +381,14 @@ show_status() {
     echo "Target SSID: $TARGET_SSID"
     
     # Check if configuration is applied
-    if [[ -f "/etc/wifi-daemon/pf-wifi-active.conf" ]]; then
-        echo "Firewall: Active"
+    if [[ "$USE_FIREWALL" == "true" ]]; then
+        if pfctl -sr 2>/dev/null | grep -q "block.*out.*on.*$WIFI_INTERFACE"; then
+            echo "Firewall: Active"
+        else
+            echo "Firewall: Inactive"
+        fi
     else
-        echo "Firewall: Inactive"
+        echo "Firewall: Disabled"
     fi
 }
 

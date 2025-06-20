@@ -6,8 +6,26 @@
 set -euo pipefail
 
 # Configuration
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+# Resolve symlinks to get the actual script directory
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [ -L "$SCRIPT_PATH" ]; do
+    SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+    SCRIPT_PATH="$(readlink "$SCRIPT_PATH")"
+    [[ "$SCRIPT_PATH" != /* ]] && SCRIPT_PATH="$SCRIPT_DIR/$SCRIPT_PATH"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+
+# Check if running from installed location
+if [[ "$SCRIPT_DIR" == "/usr/local/lib/wifi-daemon" ]]; then
+    # Installed mode - use system paths
+    CONFIG_DIR="/etc/wifi-daemon"
+    LOG_DIR="/var/lib/wifi-daemon/logs"
+else
+    # Development mode - use project paths
+    PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+    CONFIG_DIR="${PROJECT_DIR}/config"
+    LOG_DIR="${PROJECT_DIR}/logs"
+fi
 
 # Colors for output
 RED='\033[0;31m'
@@ -66,8 +84,8 @@ check_configuration() {
         local prefixes_file="/etc/wifi-daemon/prefixes.conf"
     else
         # Development mode
-        local config_file="${PROJECT_DIR}/config/config.json"
-        local prefixes_file="${PROJECT_DIR}/config/prefixes.conf"
+        local config_file="${CONFIG_DIR}/config.json"
+        local prefixes_file="${CONFIG_DIR}/prefixes.conf"
     fi
     
     # Check config files
@@ -154,7 +172,7 @@ check_network() {
         if [[ -f "/etc/wifi-daemon/config.json" ]]; then
             config_path="/etc/wifi-daemon/config.json"
         else
-            config_path="${PROJECT_DIR}/config/config.json"
+            config_path="${CONFIG_DIR}/config.json"
         fi
         target_ssid=$(jq -r '.target_ssid' "$config_path" 2>/dev/null || echo "SOME-SSID")
         

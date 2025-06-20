@@ -119,21 +119,18 @@ install_config() {
     
     # Copy configuration files
     cp "$PROJECT_DIR/config/config.json" "$CONFIG_DIR/"
-    cp "$PROJECT_DIR/config/prefixes.conf" "$CONFIG_DIR/"
     
     # Update paths in config.json to use system directories
     local temp_config=$(mktemp)
     jq --arg log_dir "$DATA_DIR/logs/wifi-daemon.log" \
        --arg backup_dir "$DATA_DIR/backups" \
-       --arg prefixes_file "$CONFIG_DIR/prefixes.conf" \
-       '.monitoring.log_file = $log_dir | .monitoring.backup_directory = $backup_dir | .prefixes.config_file = $prefixes_file' \
+       '.monitoring.log_file = $log_dir | .monitoring.backup_directory = $backup_dir' \
        "$CONFIG_DIR/config.json" > "$temp_config"
     
     mv "$temp_config" "$CONFIG_DIR/config.json"
     
     # Set permissions
     chmod 644 "$CONFIG_DIR/config.json"
-    chmod 644 "$CONFIG_DIR/prefixes.conf"
     
     log "INFO" "Configuration installed successfully"
 }

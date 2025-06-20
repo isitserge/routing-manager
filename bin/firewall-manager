@@ -6,7 +6,14 @@
 set -euo pipefail
 
 # Configuration
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve symlinks to get the actual script directory
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [ -L "$SCRIPT_PATH" ]; do
+    SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+    SCRIPT_PATH="$(readlink "$SCRIPT_PATH")"
+    [[ "$SCRIPT_PATH" != /* ]] && SCRIPT_PATH="$SCRIPT_DIR/$SCRIPT_PATH"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 
 # Check if running from installed location
 if [[ "$SCRIPT_DIR" == "/usr/local/lib/wifi-daemon" ]]; then
@@ -32,16 +39,22 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [FIREWALL] [$level] $*" | tee -a "$LOG_DIR/wifi-daemon.log"
 }
 
-# Generate firewall rules from prefix configuration
-generate_rules() {
+# Configure firewall for WiFi interface (like route-manager)
+configure_firewall() {
     local wifi_interface="$1"
     local prefixes_file="$2"
-    local pf_file="${PROJECT_DIR}/config/pf-wifi.conf"
     
-    log "INFO" "Generating firewall rules for interface $wifi_interface"
+    log "INFO" "Configuring firewall for interface $wifi_interface"
+    
+    # Backup existing rules
+    local backup_file
+    backup_file=$(backup_rules)
+    
+    # Create temporary rules file
+    local temp_pf_file=$(mktemp)
     
     # Create firewall configuration header
-    cat > "$pf_file" << EOF
+    cat > "$temp_pf_file" << EOF
 # Auto-generated WiFi isolation rules for SOME-SSID
 # Generated on $(date)
 # Interface: $wifi_interface
@@ -67,6 +80,96 @@ EOF
             # Include prefix - allow traffic to this destination
             echo "# Allow traffic to: $line"
             echo "pass out on $wifi_interface to $line"
+            echo ""
+        fi
+    done < "$prefixes_file" >> "$temp_pf_file"
+    
+    # Add essential system traffic rules
+    cat >> "$temp_pf_file" << EOF
+
+# Essential system traffic
+pass out on $wifi_interface to 169.254.0.0/16  # Link-local
+pass out on $wifi_interface proto udp to any port 53  # DNS (if needed locally)
+pass out on $wifi_interface proto udp to any port 67  # DHCP client
+pass out on $wifi_interface proto udp to any port 68  # DHCP client
+
+# Log all blocked traffic for monitoring
+block log on $wifi_interface all
+
+EOF
+    
+    # Test rule syntax first
+    if ! pfctl -nf "$temp_pf_file" 2>/dev/null; then
+        log "ERROR" "Firewall rules syntax check failed"
+        rm -f "$temp_pf_file"
+        return 1
+    fi
+    
+    # Load and enable firewall rules
+    if pfctl -f "$temp_pf_file" 2>/dev/null; then
+        log "INFO" "Firewall rules loaded successfully"
+    else
+        log "ERROR" "Failed to load firewall rules"
+        rm -f "$temp_pf_file"
+        return 1
+    fi
+    
+    # Enable packet filtering
+    if pfctl -e 2>/dev/null; then
+        log "INFO" "Packet filtering enabled"
+    else
+        log "WARN" "Could not enable packet filtering (may already be enabled)"
+    fi
+    
+    # Verify rules are active
+    if pfctl -s rules | grep -q "$wifi_interface"; then
+        log "INFO" "Firewall rules for $wifi_interface are active"
+        rm -f "$temp_pf_file"
+        return 0
+    else
+        log "ERROR" "Firewall rules for $wifi_interface not found in active ruleset"
+        rm -f "$temp_pf_file"
+        return 1
+    fi
+}
+
+# Generate firewall rules from prefix configuration (legacy)
+generate_rules() {
+    local wifi_interface="$1"
+    local prefixes_file="$2"
+    local pf_file="${CONFIG_DIR}/pf-wifi.conf"
+    
+    log "INFO" "Generating firewall rules for interface $wifi_interface"
+    
+    # Create firewall configuration header
+    cat > "$pf_file" << EOF
+# Auto-generated WiFi isolation rules for SOME-SSID
+# Generated on $(date)
+# Interface: $wifi_interface
+
+# Block all outbound traffic on WiFi interface by default
+block out on $wifi_interface all
+
+EOF
+    
+    # Process prefix configuration file
+    while IFS= read -r line; do
+        # Skip comments and empty lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// }" ]] && continue
+        
+        # Handle excluded prefixes (lines starting with !)
+        if [[ "$line" =~ ^! ]]; then
+            local excluded_prefix="${line#!}"
+            echo "# Block excluded prefix: $excluded_prefix"
+            echo "block out on $wifi_interface to $excluded_prefix"
+            echo "block in on $wifi_interface from $excluded_prefix"
+            echo ""
+        else
+            # Include prefix - allow traffic to this destination
+            echo "# Allow traffic to: $line"
+            echo "pass out on $wifi_interface to $line keep state"
+            echo "pass in on $wifi_interface from $line"
             echo ""
         fi
     done < "$prefixes_file" >> "$pf_file"
@@ -245,6 +348,13 @@ main() {
     local prefixes_file="${3:-}"
     
     case "$action" in
+        configure)
+            if [[ -z "$wifi_interface" || -z "$prefixes_file" ]]; then
+                echo "Usage: $0 configure <wifi_interface> <prefixes_file>"
+                exit 1
+            fi
+            configure_firewall "$wifi_interface" "$prefixes_file"
+            ;;
         generate)
             if [[ -z "$wifi_interface" || -z "$prefixes_file" ]]; then
                 echo "Usage: $0 generate <wifi_interface> <prefixes_file>"
@@ -281,11 +391,12 @@ main() {
             verify_rules "$wifi_interface" "${3:-8.8.8.8}"
             ;;
         *)
-            echo "Usage: $0 {generate|apply|remove|status|verify} <wifi_interface> [additional_args]"
+            echo "Usage: $0 {configure|generate|apply|remove|status|verify} <wifi_interface> [additional_args]"
             echo ""
             echo "Actions:"
-            echo "  generate <interface> <prefixes_file>  - Generate firewall rules"
-            echo "  apply <interface>                     - Apply firewall rules"
+            echo "  configure <interface> <prefixes_file> - Configure firewall dynamically (recommended)"
+            echo "  generate <interface> <prefixes_file>  - Generate firewall rules file"
+            echo "  apply <interface>                     - Apply pre-generated firewall rules"
             echo "  remove <interface>                    - Remove firewall rules"
             echo "  status <interface>                    - Show firewall status"
             echo "  verify <interface> [destination]      - Verify firewall rules"

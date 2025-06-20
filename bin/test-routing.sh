@@ -6,8 +6,26 @@
 set -euo pipefail
 
 # Configuration
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+# Resolve symlinks to get the actual script directory
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [ -L "$SCRIPT_PATH" ]; do
+    SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+    SCRIPT_PATH="$(readlink "$SCRIPT_PATH")"
+    [[ "$SCRIPT_PATH" != /* ]] && SCRIPT_PATH="$SCRIPT_DIR/$SCRIPT_PATH"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+
+# Check if running from installed location
+if [[ "$SCRIPT_DIR" == "/usr/local/lib/wifi-daemon" ]]; then
+    # Installed mode - use system paths
+    CONFIG_DIR="/etc/wifi-daemon"
+    LOG_DIR="/var/lib/wifi-daemon/logs"
+else
+    # Development mode - use project paths
+    PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+    CONFIG_DIR="${PROJECT_DIR}/config"
+    LOG_DIR="${PROJECT_DIR}/logs"
+fi
 
 # Colors for output
 RED='\033[0;31m'
@@ -44,8 +62,8 @@ test_config() {
         local prefixes_file="/etc/wifi-daemon/prefixes.conf"
     else
         # Development mode
-        local config_file="${PROJECT_DIR}/config/config.json"
-        local prefixes_file="${PROJECT_DIR}/config/prefixes.conf"
+        local config_file="${CONFIG_DIR}/config.json"
+        local prefixes_file="${CONFIG_DIR}/prefixes.conf"
     fi
     
     # Test config.json
@@ -185,15 +203,15 @@ test_firewall_rules() {
     if [[ -f "/etc/wifi-daemon/prefixes.conf" ]]; then
         local prefixes_file="/etc/wifi-daemon/prefixes.conf"
     else
-        local prefixes_file="${PROJECT_DIR}/config/prefixes.conf"
+        local prefixes_file="${CONFIG_DIR}/prefixes.conf"
     fi
     
     # Test rule generation
-    if "$PROJECT_DIR/bin/firewall-manager" generate "$test_interface" "$prefixes_file" 2>/dev/null; then
+    if "${SCRIPT_DIR}/firewall-manager" generate "$test_interface" "$prefixes_file" 2>/dev/null; then
         log "PASS" "Firewall rule generation succeeded"
         
         # Check if generated file exists and has content
-        local pf_file="${PROJECT_DIR}/config/pf-wifi.conf"
+        local pf_file="${CONFIG_DIR}/pf-wifi.conf"
         if [[ -f "$pf_file" && -s "$pf_file" ]]; then
             log "PASS" "Firewall rules file generated with content"
             
@@ -326,8 +344,8 @@ run_all_tests() {
 # Cleanup test files
 cleanup() {
     log "INFO" "Cleaning up test files..."
-    rm -f "${PROJECT_DIR}/config/pf-wifi.conf" 2>/dev/null || true
-    rm -f "${PROJECT_DIR}/logs/test.log" 2>/dev/null || true
+    rm -f "${CONFIG_DIR}/pf-wifi.conf" 2>/dev/null || true
+    rm -f "${LOG_DIR}/test.log" 2>/dev/null || true
 }
 
 # Main execution
