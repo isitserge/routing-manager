@@ -75,11 +75,13 @@ EOF
             local excluded_prefix="${line#!}"
             echo "# Block excluded prefix: $excluded_prefix"
             echo "block out on $wifi_interface to $excluded_prefix"
+            echo "block in on $wifi_interface from $excluded_prefix"
             echo ""
         else
             # Include prefix - allow traffic to this destination
             echo "# Allow traffic to: $line"
-            echo "pass out on $wifi_interface to $line"
+            echo "pass out on $wifi_interface to $line keep state"
+            echo "pass in on $wifi_interface from $line"
             echo ""
         fi
     done < "$prefixes_file" >> "$temp_pf_file"
