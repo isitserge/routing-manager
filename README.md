@@ -29,7 +29,7 @@ This solution provides bulletproof traffic isolation for specific WiFi networks 
 │   scutil        │    │  Firewall Layer  │    │  Route Layer    │
 │   Monitor       │───▶│  (pfctl rules)   │───▶│  (route table)  │
 │                 │    │                  │    │                 │
-│ SOME-SSID         │    │ Block by default │    │ No WiFi default │
+│ SOME-SSID       │    │ Block by default │    │ No WiFi default │
 │ Detection       │    │ Allow prefixes   │    │ Specific routes │
 └─────────────────┘    └──────────────────┘    └─────────────────┘
          │                       │                       │
